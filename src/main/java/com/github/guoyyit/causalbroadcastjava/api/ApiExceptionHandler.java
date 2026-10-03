@@ -1,5 +1,6 @@
 package com.github.guoyyit.causalbroadcastjava.api;
 
+import com.github.guoyyit.causalbroadcastjava.core.InvalidEnvelopeException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -12,6 +13,12 @@ import java.util.Map;
  */
 @RestControllerAdvice
 public class ApiExceptionHandler {
+
+    @ExceptionHandler(InvalidEnvelopeException.class)
+    public ResponseEntity<Map<String, String>> handleInvalidEnvelope(InvalidEnvelopeException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(Map.of("error", e.getMessage(), "reason", e.getReason().name()));
+    }
 
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, String>> handleNotFound(IllegalArgumentException e) {

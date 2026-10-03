@@ -112,13 +112,15 @@ public class CausalBroadcastService {
      * Injects a message envelope into a receiver, modelling message arrival
      * from the network. Arrival may be out of order or duplicated; the
      * receiver buffers, deduplicates and delivers in causal order.
+     *
+     * <p>The envelope is validated before anything else: envelopes from
+      * senders that never joined, and structurally inconsistent envelopes,
+      * are rejected with an {@link com.github.guoyyit.causalbroadcastjava.core.InvalidEnvelopeException}
+      * and cause no state transition, no buffering and no persistence write.
      */
     public synchronized ReceiveResult receive(String receiverId, Message message) {
         ParticipantState receiver = requireActive(receiverId);
-        if (message == null || message.getSenderId() == null || message.getSeq() <= 0
-                || message.getClock() == null) {
-            return new ReceiveResult(ReceiveStatus.REJECTED, 0);
-        }
+        EnvelopeValidator.validate(message, state);
         ReceiveStatus status = arrive(receiver, message);
         int delivered = status == ReceiveStatus.DELIVERED ? 1 : 0;
         if (status == ReceiveStatus.DELIVERED) {

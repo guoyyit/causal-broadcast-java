@@ -24,12 +24,34 @@ mvn spring-boot:run  # 本地启动服务（默认 8080 端口）
 - 参与者离开后不再接收消息，也不再阻塞其余参与者的交付与元数据回收；
   重新加入时发送序号保持单调递增，交付状态按新加入处理。
 
+## 信包校验
+
+`receive` 接口在触碰任何状态之前先校验信包的发送者身份与内部结构，
+非法信包一律拒绝（HTTP 400），且不产生任何状态变更：不交付、不进入缓冲区、
+不写入持久化状态，也不影响该发送者后续合法消息的交付与去重。校验规则：
+
+- 发送者必须已加入过广播组（活跃或已离开均可；已离开者离开前发出的在途消息仍有效），
+  从未加入过的发送者署名的信包被拒绝（`UNKNOWN_SENDER`）。
+- 序号必须为正整数（`NON_POSITIVE_SEQUENCE`）。
+- 信封标识 `id` 必须等于 `senderId:seq`（`ENVELOPE_ID_MISMATCH`）。
+- 必须携带因果元数据（向量时钟）（`MISSING_CAUSAL_METADATA`）。
+- 时钟中发送者自身的条目必须等于信封序号（`CLOCK_SEQ_MISMATCH`）。
+- 时钟引用的每个参与者都必须已加入过（`UNKNOWN_CLOCK_REFERENCE`）。
+- 信封缺失或发送者标识为空同样被拒绝（`MISSING_ENVELOPE` / `MISSING_SENDER`）。
+
 ## 持久化与崩溃恢复
 
 全部状态（成员、发送序号、交付水位、未交付缓冲区、已交付日志、读取游标、
 回收水位）在每次状态变更后原子写入 `{data-dir}/state.json`（临时文件 + 原子移动，
 崩溃不会产生半截文件）。进程重启后从该快照恢复：已交付消息不会重复交付，
 未交付的缓冲消息与因果元数据完整保留，读取游标不丢失。
+
+崩溃恢复由真实进程级端到端测试验证（`mvn test` 中的
+`CrashRecoveryProcessTest`）：启动真实服务进程，通过 HTTP 完成加入、广播、
+乱序与重复投递、部分拉取后强制终止（kill）进程，使用同一数据目录重启，
+核验已交付消息不重复交付、缓冲消息按因果序继续交付、读取游标与因果元数据
+完整恢复；另有用例在并发广播、投递与拉取期间强制终止进程，验证重启后快照
+完整可加载、无半截状态文件、无状态丢失，且因果链可继续推进。
 
 ## 元数据回收
 
@@ -49,11 +71,17 @@ mvn spring-boot:run  # 本地启动服务（默认 8080 端口）
 | GET | `/api/participants` | 列出全部参与者状态 |
 | GET | `/api/participants/{id}` | 查询单个参与者状态 |
 | POST | `/api/messages/broadcast` | 广播消息，请求体 `{"senderId":"...","payload":"..."}`，返回带向量时钟的消息信封 |
-| POST | `/api/messages/receive/{receiverId}` | 向指定接收方注入消息信封（模拟网络到达，可乱序/重复），返回 `DELIVERED/BUFFERED/DUPLICATE/REJECTED` |
+| POST | `/api/messages/receive/{receiverId}` | 向指定接收方注入消息信封（模拟网络到达，可乱序/重复），返回 `DELIVERED/BUFFERED/DUPLICATE`；非法信包返回 400 |
 | POST | `/api/participants/{id}/pull?limit=N` | 按接收方拉取已交付消息并原子推进读取游标，返回 `{cursor, messages}` |
 | POST | `/api/admin/gc` | 手动触发元数据回收 |
 
-错误码：未知参与者返回 404，对已离开参与者执行广播/接收返回 409。
+错误码：
+
+| 状态码 | 语义 |
+| --- | --- |
+| 400 | 注入的信包未通过校验，响应体 `{"error":"...","reason":"..."}` 中的 `reason` 为可机读的原因码：`MISSING_ENVELOPE`、`MISSING_SENDER`、`UNKNOWN_SENDER`、`NON_POSITIVE_SEQUENCE`、`ENVELOPE_ID_MISMATCH`、`MISSING_CAUSAL_METADATA`、`CLOCK_SEQ_MISMATCH`、`UNKNOWN_CLOCK_REFERENCE`；请求体不是合法 JSON 时同样返回 400 |
+| 404 | 未知参与者（从未加入） |
+| 409 | 对已离开参与者执行广播/接收等仅活跃参与者可做的操作 |
 
 典型流程：`join` → `broadcast` 得到消息信封 → 信封经 `receive` 到达各接收方
 （开启 `auto-fanout` 时由服务自动扇出）→ 接收方客户端用 `pull` 按游标拉取已交付消息。
