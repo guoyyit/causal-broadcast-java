@@ -2,6 +2,8 @@ package com.github.guoyyit.causalbroadcastjava.service;
 
 import com.github.guoyyit.causalbroadcastjava.core.DeliveredMessage;
 import com.github.guoyyit.causalbroadcastjava.core.Message;
+import com.github.guoyyit.causalbroadcastjava.core.InvalidEnvelopeException;
+import com.github.guoyyit.causalbroadcastjava.core.InvalidEnvelopeException.Reason;
 import com.github.guoyyit.causalbroadcastjava.core.ParticipantState;
 import com.github.guoyyit.causalbroadcastjava.core.PullResult;
 import com.github.guoyyit.causalbroadcastjava.core.ReceiveResult;
@@ -111,14 +113,14 @@ public class CausalBroadcastService {
     /**
      * Injects a message envelope into a receiver, modelling message arrival
      * from the network. Arrival may be out of order or duplicated; the
-     * receiver buffers, deduplicates and delivers in causal order.
+     * receiver buffers, deduplicates and delivers in causal order. The
+     * envelope is validated before any state change: senders that never
+     * joined and structurally invalid envelopes are rejected with an
+     * {@link InvalidEnvelopeException} and never deliver, buffer or persist.
      */
     public synchronized ReceiveResult receive(String receiverId, Message message) {
         ParticipantState receiver = requireActive(receiverId);
-        if (message == null || message.getSenderId() == null || message.getSeq() <= 0
-                || message.getClock() == null) {
-            return new ReceiveResult(ReceiveStatus.REJECTED, 0);
-        }
+        validateEnvelope(message);
         ReceiveStatus status = arrive(receiver, message);
         int delivered = status == ReceiveStatus.DELIVERED ? 1 : 0;
         if (status == ReceiveStatus.DELIVERED) {
@@ -127,6 +129,49 @@ public class CausalBroadcastService {
         gcInternal();
         persist();
         return new ReceiveResult(status, delivered);
+    }
+
+    /**
+     * Validates an injected envelope against group membership and its own
+     * causal structure. Runs before any mutation, so a rejected request leaves
+     * no trace in delivery, buffer, dedup metadata or persistent state.
+     */
+    private void validateEnvelope(Message message) {
+        if (message == null) {
+            throw new InvalidEnvelopeException(Reason.UNKNOWN_SENDER,
+                    "envelope must not be null");
+        }
+        String senderId = message.getSenderId();
+        if (senderId == null || senderId.isBlank()
+                || !state.getParticipants().containsKey(senderId)) {
+            throw new InvalidEnvelopeException(Reason.UNKNOWN_SENDER,
+                    "envelope sender never joined: " + senderId);
+        }
+        if (message.getSeq() <= 0) {
+            throw new InvalidEnvelopeException(Reason.INVALID_SEQ,
+                    "envelope sequence number must be positive: " + message.getSeq());
+        }
+        String expectedId = senderId + ":" + message.getSeq();
+        if (!expectedId.equals(message.getId())) {
+            throw new InvalidEnvelopeException(Reason.INVALID_ENVELOPE_ID,
+                    "envelope id " + message.getId() + " does not match sender/seq " + expectedId);
+        }
+        if (message.getClock() == null || message.getClock().isEmpty()) {
+            throw new InvalidEnvelopeException(Reason.MISSING_CLOCK,
+                    "envelope causal clock is missing");
+        }
+        Long selfSeq = message.getClock().get(senderId);
+        if (selfSeq == null || selfSeq != message.getSeq()) {
+            throw new InvalidEnvelopeException(Reason.CLOCK_SEQ_MISMATCH,
+                    "clock self entry " + message.getClock().get(senderId)
+                            + " does not match envelope seq " + message.getSeq());
+        }
+        for (String ref : message.getClock().keySet()) {
+            if (!state.getParticipants().containsKey(ref)) {
+                throw new InvalidEnvelopeException(Reason.UNKNOWN_CLOCK_ENTRY,
+                        "clock references a participant that never joined: " + ref);
+            }
+        }
     }
 
     private void arriveAndDrain(ParticipantState receiver, Message message) {

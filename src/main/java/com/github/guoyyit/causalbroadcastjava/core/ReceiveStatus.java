@@ -6,6 +6,5 @@ package com.github.guoyyit.causalbroadcastjava.core;
 public enum ReceiveStatus {
     DELIVERED,
     BUFFERED,
-    DUPLICATE,
-    REJECTED
+    DUPLICATE
 }

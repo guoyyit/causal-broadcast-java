@@ -24,12 +24,37 @@ mvn spring-boot:run  # 本地启动服务（默认 8080 端口）
 - 参与者离开后不再接收消息，也不再阻塞其余参与者的交付与元数据回收；
   重新加入时发送序号保持单调递增，交付状态按新加入处理。
 
+## 信封校验
+
+接收接口（`POST /api/messages/receive/{receiverId}`）在注入信包前会校验发送者身份与
+信包内部结构，校验失败直接拒绝，**不交付、不进入缓冲区、不写入持久化状态**，也不影响
+该发送者后续合法消息的正常交付与去重。拒绝在 HTTP 层返回 `400` 并携带可区分的 `reason`：
+
+| reason | 含义 |
+| --- | --- |
+| `UNKNOWN_SENDER` | 信包发送者从未加入过广播组 |
+| `INVALID_SEQ` | 信包序号非正数 |
+| `INVALID_ENVELOPE_ID` | 信封标识与发送者或序号不一致（应为 `senderId:seq`） |
+| `MISSING_CLOCK` | 因果元数据（向量时钟）缺失 |
+| `CLOCK_SEQ_MISMATCH` | 因果元数据声明的自身序号与信包序号不符 |
+| `UNKNOWN_CLOCK_ENTRY` | 因果元数据引用了从未加入过的发送者 |
+
+响应体形如 `{"error": "...", "reason": "UNKNOWN_SENDER"}`。校验在任何状态变更之前执行，
+因此被拒绝的信包不会在去重元数据或缓冲区中留下任何痕迹。
+
 ## 持久化与崩溃恢复
 
 全部状态（成员、发送序号、交付水位、未交付缓冲区、已交付日志、读取游标、
 回收水位）在每次状态变更后原子写入 `{data-dir}/state.json`（临时文件 + 原子移动，
 崩溃不会产生半截文件）。进程重启后从该快照恢复：已交付消息不会重复交付，
 未交付的缓冲消息与因果元数据完整保留，读取游标不丢失。
+
+崩溃恢复由 `RealProcessCrashRecoveryTest` 以**真实服务进程**端到端验证：测试通过
+`ProcessBuilder` 启动真实 JVM 进程运行 Spring Boot 服务，经 HTTP 完成成员加入、广播、
+乱序与重复投递、部分拉取，然后 `destroyForcibly` 强制终止进程，再用同一数据目录重启，
+核验已交付消息不重复交付、未交付缓冲消息按因果序继续交付、读取游标与因果元数据完整恢复；
+另一个场景在并发广播、投递与拉取期间强制终止进程，核验重启后状态快照完整可加载、
+无半截状态文件或状态丢失。运行 `mvn test` 即可执行全部验证。
 
 ## 元数据回收
 
@@ -49,11 +74,17 @@ mvn spring-boot:run  # 本地启动服务（默认 8080 端口）
 | GET | `/api/participants` | 列出全部参与者状态 |
 | GET | `/api/participants/{id}` | 查询单个参与者状态 |
 | POST | `/api/messages/broadcast` | 广播消息，请求体 `{"senderId":"...","payload":"..."}`，返回带向量时钟的消息信封 |
-| POST | `/api/messages/receive/{receiverId}` | 向指定接收方注入消息信封（模拟网络到达，可乱序/重复），返回 `DELIVERED/BUFFERED/DUPLICATE/REJECTED` |
+| POST | `/api/messages/receive/{receiverId}` | 向指定接收方注入消息信封（模拟网络到达，可乱序/重复），返回 `DELIVERED/BUFFERED/DUPLICATE`；信封校验失败返回 `400` 并携带 `reason` |
 | POST | `/api/participants/{id}/pull?limit=N` | 按接收方拉取已交付消息并原子推进读取游标，返回 `{cursor, messages}` |
 | POST | `/api/admin/gc` | 手动触发元数据回收 |
 
-错误码：未知参与者返回 404，对已离开参与者执行广播/接收返回 409。
+错误码：
+
+| 状态码 | 语义 |
+| --- | --- |
+| 400 | 信包校验失败（发送者未知或结构非法），响应体携带可区分的 `reason`，见上文「信封校验」 |
+| 404 | 参与者不存在（如向未知接收者拉取或投递） |
+| 409 | 参与者已离开广播组（对已离开参与者执行广播/接收） |
 
 典型流程：`join` → `broadcast` 得到消息信封 → 信封经 `receive` 到达各接收方
 （开启 `auto-fanout` 时由服务自动扇出）→ 接收方客户端用 `pull` 按游标拉取已交付消息。
